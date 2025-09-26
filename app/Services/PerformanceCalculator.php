@@ -2,18 +2,14 @@
 
 namespace App\Services;
 
-use App\Models\Department;
 use App\Models\PerformanceScore;
 use App\Models\User;
+use App\Services\BusinessRules\BusinessRule;
 use Carbon\Carbon;
 
 class PerformanceCalculator
 {
-    private const TASK_COMPLETION_WEIGHT = 0.30;
-    private const DEADLINE_ADHERENCE_WEIGHT = 0.25;
-    private const PEER_REVIEWS_WEIGHT = 0.25;
-    private const TRAINING_COMPLETION_WEIGHT = 0.20;
-    private const NEW_EMPLOYEE_MIN_MONTHS = 3;
+    private array $weights;
 
     public function __construct(
         private readonly SnapshotBuilder $snapshotBuilder,
@@ -22,8 +18,15 @@ class PerformanceCalculator
         private readonly PeerReviewCalculator $peerReviewCalculator,
         private readonly TrainingCompletionCalculator $trainingCompletionCalculator,
         private readonly ScoreRepository $scoreRepository,
-        private readonly ReportService $reportService
+        private readonly ReportService $reportService,
+        private readonly BusinessRule $businessRule
     ) {
+        $this->weights = config('performance.weights', [
+            'task_completion' => 0.30,
+            'deadline_adherence' => 0.25,
+            'peer_reviews' => 0.25,
+            'training_completion' => 0.20,
+        ]);
     }
 
     private function roundToOneDecimal(float $value): float
@@ -69,8 +72,36 @@ class PerformanceCalculator
 
     public function generateEmployeeReport(User $employee, ?Carbon $from = null, ?Carbon $to = null): array
     {
-        // Ensure a fresh snapshot exists and get the latest values
-        $snapshot = $this->calculateForEmployee($employee);
+        $latest = $this->scoreRepository->getLatest($employee);
+        if ($latest) {
+            $snapshot = $this->snapshotBuilder->build(
+                $employee,
+                $latest->task_completion,
+                $latest->deadline_adherence,
+                $latest->peer_reviews,
+                $latest->training_completion,
+                $latest->final_score,
+                $latest->department_rank,
+                $latest
+            );
+        } else {
+            $snapshot = [
+                'employee_id' => $employee->id,
+                'name' => $employee->name,
+                'department' => $employee->department?->name,
+                'performance_score' => 0.0,
+                'breakdown' => [
+                    'task_completion' => 0.0,
+                    'deadline_adherence' => 0.0,
+                    'peer_reviews' => 0.0,
+                    'training_completion' => 0.0,
+                ],
+                'department_rank' => null,
+                'total_employees_in_department' => $employee->department?->users()->count() ?? 0,
+                'last_calculated' => null,
+            ];
+        }
+
         $report = $this->reportService->buildEmployeeReport($employee, $from, $to);
 
         return [
@@ -79,20 +110,20 @@ class PerformanceCalculator
             'components_trend' => $report['components_trend'],
             'department' => $report['department'],
             'weights' => [
-                'task_completion' => 30,
-                'deadline_adherence' => 25,
-                'peer_reviews' => 25,
-                'training_completion' => 20,
+                'task_completion' => ($this->weights['task_completion'] * 100),
+                'deadline_adherence' => ($this->weights['deadline_adherence'] * 100),
+                'peer_reviews' => ($this->weights['peer_reviews'] * 100),
+                'training_completion' => ($this->weights['training_completion'] * 100),
             ],
         ];
     }
 
     private function weightedScore(float $taskCompletion, float $deadlineAdherence, float $peerReview, float $trainingCompletion): float
     {
-        return $taskCompletion * self::TASK_COMPLETION_WEIGHT +
-            $deadlineAdherence * self::DEADLINE_ADHERENCE_WEIGHT +
-            $peerReview * self::PEER_REVIEWS_WEIGHT +
-            $trainingCompletion * self::TRAINING_COMPLETION_WEIGHT;
+        return $taskCompletion * $this->weights['task_completion'] +
+            $deadlineAdherence * $this->weights['deadline_adherence'] +
+            $peerReview * $this->weights['peer_reviews'] +
+            $trainingCompletion * $this->weights['training_completion'];
     }
 
     private function calculateTaskCompletionRate(User $employee): float
@@ -132,11 +163,7 @@ class PerformanceCalculator
 
     private function applyBusinessRules(User $employee, float $finalScoreRaw): float
     {
-        $finalScore = $finalScoreRaw;
-        // New Employee Rule
-        if ($employee->hire_date && Carbon::parse($employee->hire_date)->gt(Carbon::now()->subMonths(self::NEW_EMPLOYEE_MIN_MONTHS))) {
-            $finalScore = max($finalScore, 50);
-        }
+        $finalScore = $this->businessRule->apply($employee, $finalScoreRaw);
         return $this->roundToOneDecimal($finalScore);
     }
 
@@ -160,32 +187,6 @@ class PerformanceCalculator
         );
     }
 
-    public function departmentSummary(Department $department): array
-    {
-        $employees = $department->users()->with('performanceScores')->get();
-        $scores = $employees->map(fn ($u) => optional($u->performanceScores->sortByDesc('calculated_at')->first())->final_score ?? 0.0);
-
-        $average = $scores->count() ? $this->roundToOneDecimal($scores->avg()) : 0.0;
-
-        $ranked = $employees->map(function ($u) {
-            $latest = $u->performanceScores->sortByDesc('calculated_at')->first();
-            return [
-                'id' => $u->id,
-                'name' => $u->name,
-                'score' => $latest?->final_score ?? 0.0,
-            ];
-        })->sortByDesc('score')->values();
-
-        return [
-            'department_id' => $department->id,
-            'department_name' => $department->name,
-            'average_score' => $average,
-            'total_employees' => $employees->count(),
-            'top_performers' => $ranked->take(3)->all(),
-            'improvement_needed' => $ranked->reverse()->take(3)->values()->all(),
-        ];
-    }
-
     private function calculateDepartmentRank(User $employee, ?float $employeeScore = null): ?int
     {
         if (!$employee->department) {
@@ -193,7 +194,8 @@ class PerformanceCalculator
         }
 
         if ($employeeScore === null) {
-            $employeeScore = null ?? 0.0;
+            $latestSelf = $employee->performanceScores()->orderByDesc('calculated_at')->first();
+            $employeeScore = $latestSelf?->final_score ?? 0.0;
         }
 
         $employees = $employee->department->users;

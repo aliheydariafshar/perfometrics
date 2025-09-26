@@ -38,4 +38,12 @@ class ScoreRepository
             ->where('user_id', $employee->id)
             ->orderBy('calculated_at');
     }
+
+    public function getLatest(User $employee): ?PerformanceScore
+    {
+        return PerformanceScore::query()
+            ->where('user_id', $employee->id)
+            ->orderByDesc('calculated_at')
+            ->first();
+    }
 }

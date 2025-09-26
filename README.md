@@ -28,14 +28,14 @@ Notes:
 
 ### Business Logic
 
-- Performance Score = 30% tasks + 25% deadlines + 25% peer reviews + 20% training
-- New Employee Rule: tenure < 3 months ⇒ minimum 50
+- Performance Score weights are configurable in `config/performance.php` (defaults: 30/25/25/20)
+- Business rules are pluggable via `App\Services\BusinessRules\BusinessRule`; default `NewEmployeeMinimumRule` uses config values (defaults: tenure < 3 months ⇒ min 50)
 - Missing component data counts as 0; scores rounded to 1 decimal
 
 ### Architecture
 
 - Calculators in `app/Services` (task, deadline, peer review, training)
-- `PerformanceCalculator` applies weights, rounding, new employee rule, department rank, and persists `PerformanceScore`
+- `PerformanceCalculator` applies weights and business rules; persistence and department analytics are handled by `ScoreRepository` and `DepartmentAnalytics`
 - Batch orchestration via `OrchestratePerformanceBatchJob` adding `CalculateEmployeePerformanceJob` per user
 
 ### Rate Limiting
@@ -48,6 +48,7 @@ Notes:
 - Run: `php artisan test`
 - Uses SQLite by default (ensure `database/database.sqlite` exists)
 - Unit tests for calculators; feature tests per controller with success and error cases
+ - `PerformanceCalculatorTest` verifies config-driven weights and rule application
 
 ### Assumptions
 
